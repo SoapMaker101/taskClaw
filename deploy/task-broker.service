@@ -1,0 +1,20 @@
+[Unit]
+Description=Task Broker (staff Telegram bot + REST for OpenClaw)
+After=network.target
+
+[Service]
+Type=simple
+User=taskbroker
+Group=taskbroker
+WorkingDirectory=/opt/task-broker
+EnvironmentFile=/opt/task-broker/.env
+ExecStart=/opt/task-broker/venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8089
+Restart=on-failure
+RestartSec=5
+
+# Hardening (optional; adjust if you hit permission issues)
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

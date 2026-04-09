@@ -1,0 +1,3 @@
+# Crontab fragment (root or taskbroker). Adjust paths.
+# Daily backup of the broker database at 03:15
+# 15 3 * * * cp /opt/task-broker/data/tasks.db /opt/task-broker/backups/tasks-$(date +\%Y\%m\%d).db
