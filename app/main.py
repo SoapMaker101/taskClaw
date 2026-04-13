@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import sqlite3
 from contextlib import asynccontextmanager
 from typing import Annotated, Optional
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
-from fastapi import Depends, FastAPI, Header, HTTPException, Query
+from aiogram.types import BufferedInputFile
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Query, UploadFile
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, model_validator
 from uvicorn import Config, Server
 
@@ -118,8 +121,70 @@ def _resolve_assignee(con: sqlite3.Connection, body: TaskCreate) -> str:
     return str(matches[0]["tg_user_id"])
 
 
+_MAX_BYTES = settings.max_file_size_mb * 1024 * 1024
+
+
+async def _read_upload(f: UploadFile) -> bytes:
+    data = await f.read()
+    if len(data) > _MAX_BYTES:
+        raise HTTPException(status_code=413, detail=f"File too large (max {settings.max_file_size_mb} MB)")
+    return data
+
+
 @app.post("/tasks", dependencies=[Depends(verify_bearer)])
-async def api_create_task(body: TaskCreate) -> dict:
+async def api_create_task(
+    title: Annotated[str, Form()],
+    assignee_tg_id: Annotated[Optional[str], Form()] = None,
+    assignee_name: Annotated[Optional[str], Form()] = None,
+    body: Annotated[Optional[str], Form()] = None,
+    due_at: Annotated[Optional[str], Form()] = None,
+    files: list[UploadFile] = File(default=[]),
+) -> dict:
+    tc = TaskCreate(
+        assignee_tg_id=assignee_tg_id,
+        assignee_name=assignee_name,
+        title=title,
+        body=body,
+        due_at=due_at,
+    )
+    with db.get_conn() as con:
+        assignee = _resolve_assignee(con, tc)
+        task_id = db.create_task_and_send(con, assignee, tc.title, tc.body, tc.due_at)
+
+    saved: list[dict] = []
+    if files:
+        for f in files:
+            data = await _read_upload(f)
+            with db.get_conn() as con:
+                att = db.save_attachment(
+                    con, task_id, f.filename or "file", data,
+                    mime_type=f.content_type, uploaded_by="api", phase="creation",
+                )
+            saved.append(att)
+
+    bot: Bot = app.state.staff_bot
+    due_line = f"\nСрок: {tc.due_at}" if tc.due_at else ""
+    msg = f"Поручение\n{tc.title}\n{tc.body or ''}{due_line}\n\nОтветьте «готово» или /done когда выполните."
+    try:
+        await bot.send_message(int(assignee), msg)
+        for att in saved:
+            fp = db.attachment_fs_path(att["stored_path"])
+            buf = BufferedInputFile(fp.read_bytes(), filename=att["file_name"])
+            await bot.send_document(int(assignee), buf)
+    except Exception as e:
+        logger.exception("deliver task to staff")
+        raise HTTPException(status_code=502, detail=f"telegram_send_failed: {e!s}") from e
+
+    with db.get_conn() as con:
+        db.set_task_sent(con, task_id)
+
+    public = [{k: v for k, v in a.items() if k != "stored_path"} for a in saved]
+    return {"task_id": task_id, "assignee_tg_id": assignee, "status": "sent", "attachments": public}
+
+
+@app.post("/tasks/json", dependencies=[Depends(verify_bearer)])
+async def api_create_task_json(body: TaskCreate) -> dict:
+    """JSON-only task creation (no file attachments)."""
     with db.get_conn() as con:
         assignee = _resolve_assignee(con, body)
         task_id = db.create_task_and_send(con, assignee, body.title, body.body, body.due_at)
@@ -139,6 +204,58 @@ async def api_create_task(body: TaskCreate) -> dict:
     return {"task_id": task_id, "assignee_tg_id": assignee, "status": "sent"}
 
 
+# ── Attachments CRUD ──────────────────────────────────────────────────
+
+
+@app.post("/tasks/{task_id}/attachments", dependencies=[Depends(verify_bearer)])
+async def api_upload_attachment(
+    task_id: str,
+    file: UploadFile = File(...),
+    phase: Annotated[str, Form()] = "creation",
+) -> dict:
+    with db.get_conn() as con:
+        if not db.get_task(con, task_id):
+            raise HTTPException(status_code=404, detail="Task not found")
+    data = await _read_upload(file)
+    with db.get_conn() as con:
+        att = db.save_attachment(
+            con, task_id, file.filename or "file", data,
+            mime_type=file.content_type, uploaded_by="api", phase=phase,
+        )
+    return {"attachment": att}
+
+
+@app.get("/tasks/{task_id}/attachments", dependencies=[Depends(verify_bearer)])
+async def api_list_attachments(task_id: str) -> dict:
+    with db.get_conn() as con:
+        if not db.get_task(con, task_id):
+            raise HTTPException(status_code=404, detail="Task not found")
+        return {"attachments": db.list_attachments(con, task_id)}
+
+
+@app.get("/attachments/{attachment_id}", dependencies=[Depends(verify_bearer)])
+async def api_download_attachment(attachment_id: str):
+    with db.get_conn() as con:
+        att = db.get_attachment(con, attachment_id)
+    if not att:
+        raise HTTPException(status_code=404, detail="Attachment not found")
+    fp = db.attachment_fs_path(att["stored_path"])
+    if not fp.exists():
+        raise HTTPException(status_code=404, detail="File missing from storage")
+    return FileResponse(fp, filename=att["file_name"], media_type=att["mime_type"] or "application/octet-stream")
+
+
+@app.delete("/attachments/{attachment_id}", dependencies=[Depends(verify_bearer)])
+async def api_delete_attachment(attachment_id: str) -> dict:
+    with db.get_conn() as con:
+        if not db.delete_attachment(con, attachment_id):
+            raise HTTPException(status_code=404, detail="Attachment not found")
+    return {"deleted": True}
+
+
+# ── Tasks list / detail ──────────────────────────────────────────────
+
+
 @app.get("/tasks", dependencies=[Depends(verify_bearer)])
 async def api_list_tasks(status: Annotated[Optional[str], Query()] = None) -> dict:
     with db.get_conn() as con:
@@ -149,9 +266,10 @@ async def api_list_tasks(status: Annotated[Optional[str], Query()] = None) -> di
 async def api_get_task(task_id: str) -> dict:
     with db.get_conn() as con:
         row = db.get_task(con, task_id)
-    if not row:
-        raise HTTPException(status_code=404, detail="Task not found")
-    return {"task": row}
+        if not row:
+            raise HTTPException(status_code=404, detail="Task not found")
+        attachments = db.list_attachments(con, task_id)
+    return {"task": row, "attachments": attachments}
 
 
 def main() -> None:

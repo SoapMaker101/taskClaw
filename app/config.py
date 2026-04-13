@@ -12,6 +12,8 @@ class Settings(BaseSettings):
     broker_host: str = "127.0.0.1"
     broker_port: int = 8089
     database_path: str = "./data/tasks.db"
+    upload_dir: str = "./data/files"
+    max_file_size_mb: int = 20
 
 
 settings = Settings()

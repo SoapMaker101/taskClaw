@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import sqlite3
 import uuid
 from contextlib import contextmanager
@@ -13,6 +14,12 @@ from app.config import settings
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _upload_dir() -> Path:
+    p = Path(settings.upload_dir)
+    p.mkdir(parents=True, exist_ok=True)
+    return p
 
 
 def init_db() -> None:
@@ -54,6 +61,21 @@ def init_db() -> None:
 
             CREATE INDEX IF NOT EXISTS idx_tasks_assignee ON tasks(assignee_tg_id);
             CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
+
+            CREATE TABLE IF NOT EXISTS task_attachments (
+              id            TEXT PRIMARY KEY,
+              task_id       TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+              file_name     TEXT NOT NULL,
+              stored_path   TEXT NOT NULL,
+              mime_type     TEXT,
+              size_bytes    INTEGER,
+              uploaded_by   TEXT,
+              phase         TEXT NOT NULL DEFAULT 'creation'
+                CHECK (phase IN ('creation', 'completion')),
+              created_at    TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_attachments_task ON task_attachments(task_id);
             """
         )
         con.commit()
@@ -202,3 +224,73 @@ def mark_reminder_sent(con: sqlite3.Connection, task_id: str) -> None:
     con.execute("UPDATE tasks SET reminder_sent = 1 WHERE id = ?", (task_id,))
     event(con, task_id, "reminder_sent", None)
     con.commit()
+
+
+# ── Attachments ──────────────────────────────────────────────────────────
+
+
+def save_attachment(
+    con: sqlite3.Connection,
+    task_id: str,
+    file_name: str,
+    data: bytes,
+    mime_type: Optional[str] = None,
+    uploaded_by: Optional[str] = None,
+    phase: str = "creation",
+) -> dict[str, Any]:
+    att_id = str(uuid.uuid4())
+    ext = Path(file_name).suffix or ""
+    stored_name = f"{att_id}{ext}"
+    dest = _upload_dir() / stored_name
+    dest.write_bytes(data)
+
+    con.execute(
+        """
+        INSERT INTO task_attachments
+          (id, task_id, file_name, stored_path, mime_type, size_bytes, uploaded_by, phase, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (att_id, task_id, file_name, stored_name, mime_type, len(data), uploaded_by, phase, _utc_now()),
+    )
+    event(con, task_id, "attachment_added", {"attachment_id": att_id, "file_name": file_name, "phase": phase})
+    con.commit()
+    return {
+        "id": att_id,
+        "task_id": task_id,
+        "file_name": file_name,
+        "stored_path": stored_name,
+        "mime_type": mime_type,
+        "size_bytes": len(data),
+        "phase": phase,
+    }
+
+
+def list_attachments(con: sqlite3.Connection, task_id: str) -> list[dict[str, Any]]:
+    rows = con.execute(
+        "SELECT id, task_id, file_name, mime_type, size_bytes, uploaded_by, phase, created_at "
+        "FROM task_attachments WHERE task_id = ? ORDER BY created_at",
+        (task_id,),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_attachment(con: sqlite3.Connection, attachment_id: str) -> Optional[dict[str, Any]]:
+    row = con.execute("SELECT * FROM task_attachments WHERE id = ?", (attachment_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def attachment_fs_path(stored_path: str) -> Path:
+    return _upload_dir() / stored_path
+
+
+def delete_attachment(con: sqlite3.Connection, attachment_id: str) -> bool:
+    row = con.execute("SELECT stored_path, task_id FROM task_attachments WHERE id = ?", (attachment_id,)).fetchone()
+    if not row:
+        return False
+    fp = attachment_fs_path(row["stored_path"])
+    if fp.exists():
+        fp.unlink()
+    con.execute("DELETE FROM task_attachments WHERE id = ?", (attachment_id,))
+    event(con, row["task_id"], "attachment_removed", {"attachment_id": attachment_id})
+    con.commit()
+    return True
