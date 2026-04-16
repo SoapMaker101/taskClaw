@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import csv
+import io
 import json
-import shutil
 import sqlite3
 import uuid
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Generator, Optional
 
@@ -38,6 +39,20 @@ def init_db() -> None:
               created_at   TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS contact_groups (
+              id         TEXT PRIMARY KEY,
+              name       TEXT NOT NULL UNIQUE,
+              created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS contact_group_members (
+              group_id    TEXT NOT NULL REFERENCES contact_groups(id) ON DELETE CASCADE,
+              tg_user_id  TEXT NOT NULL REFERENCES contacts(tg_user_id) ON DELETE CASCADE,
+              PRIMARY KEY (group_id, tg_user_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_group_members_user ON contact_group_members(tg_user_id);
+
             CREATE TABLE IF NOT EXISTS tasks (
               id              TEXT PRIMARY KEY,
               title           TEXT NOT NULL,
@@ -48,7 +63,13 @@ def init_db() -> None:
                 CHECK (status IN ('pending', 'sent', 'done', 'cancelled')),
               created_at      TEXT NOT NULL,
               completed_note  TEXT,
-              reminder_sent   INTEGER NOT NULL DEFAULT 0
+              completed_at    TEXT,
+              reminder_sent   INTEGER NOT NULL DEFAULT 0,
+              sent_at         TEXT,
+              idle_nudges_sent INTEGER NOT NULL DEFAULT 0,
+              last_idle_nudge_at TEXT,
+              source_group_id TEXT REFERENCES contact_groups(id),
+              batch_id        TEXT
             );
 
             CREATE TABLE IF NOT EXISTS task_events (
@@ -79,6 +100,78 @@ def init_db() -> None:
             """
         )
         con.commit()
+        _migrate_tasks_reminder_columns(con)
+        _migrate_groups_and_task_columns(con)
+        con.commit()
+
+
+def _migrate_tasks_reminder_columns(con: sqlite3.Connection) -> None:
+    """Add columns introduced after first deploy (SQLite has no IF NOT EXISTS for columns)."""
+    rows = con.execute("PRAGMA table_info(tasks)").fetchall()
+    cols = {str(r[1]) for r in rows}
+    alters: list[str] = []
+    if "sent_at" not in cols:
+        alters.append("ALTER TABLE tasks ADD COLUMN sent_at TEXT")
+    if "idle_nudges_sent" not in cols:
+        alters.append("ALTER TABLE tasks ADD COLUMN idle_nudges_sent INTEGER NOT NULL DEFAULT 0")
+    if "last_idle_nudge_at" not in cols:
+        alters.append("ALTER TABLE tasks ADD COLUMN last_idle_nudge_at TEXT")
+    for stmt in alters:
+        con.execute(stmt)
+    # Backfill sent_at for already-delivered tasks (best-effort).
+    con.execute(
+        """
+        UPDATE tasks SET sent_at = created_at
+        WHERE status = 'sent' AND (sent_at IS NULL OR TRIM(COALESCE(sent_at, '')) = '')
+        """
+    )
+
+
+def _migrate_groups_and_task_columns(con: sqlite3.Connection) -> None:
+    """contact_groups / members + tasks.source_group_id, batch_id, completed_at."""
+    con.execute(
+        """
+        CREATE TABLE IF NOT EXISTS contact_groups (
+          id         TEXT PRIMARY KEY,
+          name       TEXT NOT NULL UNIQUE,
+          created_at TEXT NOT NULL
+        )
+        """
+    )
+    con.execute(
+        """
+        CREATE TABLE IF NOT EXISTS contact_group_members (
+          group_id    TEXT NOT NULL REFERENCES contact_groups(id) ON DELETE CASCADE,
+          tg_user_id  TEXT NOT NULL REFERENCES contacts(tg_user_id) ON DELETE CASCADE,
+          PRIMARY KEY (group_id, tg_user_id)
+        )
+        """
+    )
+    con.execute(
+        "CREATE INDEX IF NOT EXISTS idx_group_members_user ON contact_group_members(tg_user_id)"
+    )
+    rows = con.execute("PRAGMA table_info(tasks)").fetchall()
+    cols = {str(r[1]) for r in rows}
+    for col, stmt in (
+        ("completed_at", "ALTER TABLE tasks ADD COLUMN completed_at TEXT"),
+        ("source_group_id", "ALTER TABLE tasks ADD COLUMN source_group_id TEXT"),
+        ("batch_id", "ALTER TABLE tasks ADD COLUMN batch_id TEXT"),
+    ):
+        if col not in cols:
+            con.execute(stmt)
+
+
+def _parse_iso_utc(raw: Optional[str]) -> Optional[datetime]:
+    if not raw:
+        return None
+    try:
+        s = raw.replace("Z", "+00:00") if raw.endswith("Z") else raw
+        d = datetime.fromisoformat(s)
+        if d.tzinfo is None:
+            d = d.replace(tzinfo=timezone.utc)
+        return d.astimezone(timezone.utc)
+    except (TypeError, ValueError):
+        return None
 
 
 @contextmanager
@@ -122,23 +215,42 @@ def create_task_and_send(
     title: str,
     body: Optional[str],
     due_at: Optional[str],
+    source_group_id: Optional[str] = None,
+    batch_id: Optional[str] = None,
 ) -> str:
     tid = str(uuid.uuid4())
     now = _utc_now()
     con.execute(
         """
-        INSERT INTO tasks (id, title, body, assignee_tg_id, due_at, status, created_at)
-        VALUES (?, ?, ?, ?, ?, 'pending', ?)
+        INSERT INTO tasks (
+          id, title, body, assignee_tg_id, due_at, status, created_at,
+          source_group_id, batch_id
+        )
+        VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?)
         """,
-        (tid, title, body or "", assignee_tg_id, due_at, now),
+        (tid, title, body or "", assignee_tg_id, due_at, now, source_group_id, batch_id),
     )
-    event(con, tid, "created", {"assignee_tg_id": assignee_tg_id, "due_at": due_at})
+    event(
+        con,
+        tid,
+        "created",
+        {
+            "assignee_tg_id": assignee_tg_id,
+            "due_at": due_at,
+            "source_group_id": source_group_id,
+            "batch_id": batch_id,
+        },
+    )
     con.commit()
     return tid
 
 
 def set_task_sent(con: sqlite3.Connection, task_id: str) -> None:
-    con.execute("UPDATE tasks SET status = 'sent' WHERE id = ?", (task_id,))
+    now = _utc_now()
+    con.execute(
+        "UPDATE tasks SET status = 'sent', sent_at = ? WHERE id = ?",
+        (now, task_id),
+    )
     event(con, task_id, "sent", None)
     con.commit()
 
@@ -171,9 +283,13 @@ def complete_latest_open_task(con: sqlite3.Connection, assignee_tg_id: str, note
     if not row:
         return None
     tid = row["id"]
+    done_at = _utc_now()
     con.execute(
-        "UPDATE tasks SET status = 'done', completed_note = ?, reminder_sent = 1 WHERE id = ?",
-        (note, tid),
+        """
+        UPDATE tasks SET status = 'done', completed_note = ?, reminder_sent = 1, completed_at = ?
+        WHERE id = ?
+        """,
+        (note, done_at, tid),
     )
     event(con, tid, "done", {"note": note})
     con.commit()
@@ -224,6 +340,278 @@ def mark_reminder_sent(con: sqlite3.Connection, task_id: str) -> None:
     con.execute("UPDATE tasks SET reminder_sent = 1 WHERE id = ?", (task_id,))
     event(con, task_id, "reminder_sent", None)
     con.commit()
+
+
+def tasks_needing_idle_nudge(
+    con: sqlite3.Connection,
+    interval_hours: int,
+    max_nudges: int,
+    min_span_hours: int = 72,
+) -> list[dict[str, Any]]:
+    """
+    Open tasks (status=sent) that deserve a gentle follow-up before the deadline.
+    Only tasks where (due_at - sent_at) >= min_span_hours (default 72) get pre-deadline nudges.
+    Without due_at, no pre-deadline nudges (cannot verify span).
+    Skips overdue rows (handled by overdue reminder path).
+    """
+    if max_nudges <= 0 or interval_hours <= 0:
+        return []
+    rows = con.execute(
+        """
+        SELECT * FROM tasks
+        WHERE status = 'sent' AND idle_nudges_sent < ?
+        """,
+        (max_nudges,),
+    ).fetchall()
+    now = datetime.now(timezone.utc)
+    delta = timedelta(hours=interval_hours)
+    min_span = timedelta(hours=max(0, min_span_hours))
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        row = dict(r)
+        due_raw = row.get("due_at")
+        due_dt = _parse_iso_utc(due_raw) if due_raw else None
+        if due_dt is None:
+            continue
+        if due_dt < now:
+            continue
+        base_raw = row.get("sent_at") or row.get("created_at")
+        base_dt = _parse_iso_utc(base_raw)
+        if base_dt is None:
+            continue
+        if due_dt - base_dt < min_span:
+            continue
+        last_raw = row.get("last_idle_nudge_at")
+        last_dt = _parse_iso_utc(last_raw) if last_raw else None
+        next_at = base_dt + delta if last_dt is None else last_dt + delta
+        if now >= next_at:
+            out.append(row)
+    return out
+
+
+def mark_idle_nudge_sent(con: sqlite3.Connection, task_id: str) -> None:
+    now = _utc_now()
+    con.execute(
+        """
+        UPDATE tasks
+        SET idle_nudges_sent = idle_nudges_sent + 1,
+            last_idle_nudge_at = ?
+        WHERE id = ?
+        """,
+        (now, task_id),
+    )
+    event(con, task_id, "idle_reminder_sent", None)
+    con.commit()
+
+
+# ── Contact groups ───────────────────────────────────────────────────────
+
+
+def get_contact_group(con: sqlite3.Connection, group_id: str) -> Optional[dict[str, Any]]:
+    row = con.execute("SELECT * FROM contact_groups WHERE id = ?", (group_id,)).fetchone()
+    if not row:
+        return None
+    base = dict(row)
+    members = con.execute(
+        """
+        SELECT c.tg_user_id, c.full_name, c.username
+        FROM contact_group_members m
+        JOIN contacts c ON c.tg_user_id = m.tg_user_id
+        WHERE m.group_id = ?
+        ORDER BY c.full_name
+        """,
+        (group_id,),
+    ).fetchall()
+    base["members"] = [dict(m) for m in members]
+    return base
+
+
+def list_contact_groups(con: sqlite3.Connection) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for r in con.execute("SELECT id FROM contact_groups ORDER BY name").fetchall():
+        g = get_contact_group(con, str(r["id"]))
+        if g:
+            out.append(g)
+    return out
+
+
+def insert_contact_group(con: sqlite3.Connection, name: str, member_tg_ids: list[str]) -> str:
+    gid = str(uuid.uuid4())
+    now = _utc_now()
+    con.execute(
+        "INSERT INTO contact_groups (id, name, created_at) VALUES (?, ?, ?)",
+        (gid, name.strip(), now),
+    )
+    for uid in dict.fromkeys(member_tg_ids):
+        con.execute(
+            "INSERT INTO contact_group_members (group_id, tg_user_id) VALUES (?, ?)",
+            (gid, uid),
+        )
+    con.commit()
+    return gid
+
+
+def patch_group_members(
+    con: sqlite3.Connection,
+    group_id: str,
+    add_tg_ids: list[str],
+    remove_tg_ids: list[str],
+) -> None:
+    for uid in add_tg_ids:
+        con.execute(
+            "INSERT OR IGNORE INTO contact_group_members (group_id, tg_user_id) VALUES (?, ?)",
+            (group_id, uid),
+        )
+    for uid in remove_tg_ids:
+        con.execute(
+            "DELETE FROM contact_group_members WHERE group_id = ? AND tg_user_id = ?",
+            (group_id, uid),
+        )
+    con.commit()
+
+
+def group_member_tg_ids(con: sqlite3.Connection, group_id: str) -> list[str]:
+    rows = con.execute(
+        "SELECT tg_user_id FROM contact_group_members WHERE group_id = ? ORDER BY tg_user_id",
+        (group_id,),
+    ).fetchall()
+    return [str(r["tg_user_id"]) for r in rows]
+
+
+def list_sent_tasks_by_batch_id(con: sqlite3.Connection, batch_id: str) -> list[dict[str, Any]]:
+    rows = con.execute(
+        """
+        SELECT * FROM tasks
+        WHERE batch_id = ? AND status = 'sent'
+        ORDER BY assignee_tg_id
+        """,
+        (batch_id,),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def tasks_for_summary_scope(
+    con: sqlite3.Connection,
+    scope: str,
+    assignee_tg_id: Optional[str],
+    group_id: Optional[str],
+) -> list[dict[str, Any]]:
+    if scope == "all":
+        q = """
+            SELECT t.*, c.full_name AS assignee_name
+            FROM tasks t
+            LEFT JOIN contacts c ON c.tg_user_id = t.assignee_tg_id
+            ORDER BY datetime(t.created_at) DESC
+        """
+        rows = con.execute(q).fetchall()
+    elif scope == "user":
+        if not assignee_tg_id:
+            return []
+        q = """
+            SELECT t.*, c.full_name AS assignee_name
+            FROM tasks t
+            LEFT JOIN contacts c ON c.tg_user_id = t.assignee_tg_id
+            WHERE t.assignee_tg_id = ?
+            ORDER BY datetime(t.created_at) DESC
+        """
+        rows = con.execute(q, (assignee_tg_id,)).fetchall()
+    elif scope == "group":
+        if not group_id:
+            return []
+        q = """
+            SELECT t.*, c.full_name AS assignee_name
+            FROM tasks t
+            LEFT JOIN contacts c ON c.tg_user_id = t.assignee_tg_id
+            WHERE t.source_group_id = ?
+               OR t.assignee_tg_id IN (
+                 SELECT tg_user_id FROM contact_group_members WHERE group_id = ?
+               )
+            ORDER BY datetime(t.created_at) DESC
+        """
+        rows = con.execute(q, (group_id, group_id)).fetchall()
+    else:
+        return []
+    return [dict(r) for r in rows]
+
+
+def build_tasks_summary_csv(
+    con: sqlite3.Connection,
+    scope: str,
+    assignee_tg_id: Optional[str],
+    group_id: Optional[str],
+) -> str:
+    """UTF-8 text; caller may add BOM for Excel."""
+    rows = tasks_for_summary_scope(con, scope, assignee_tg_id, group_id)
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(
+        [
+            "section",
+            "id",
+            "title",
+            "status",
+            "assignee_tg_id",
+            "assignee_name",
+            "due_at",
+            "created_at",
+            "completed_at",
+            "source_group_id",
+            "batch_id",
+        ]
+    )
+
+    def write_block(section: str, subset: list[dict[str, Any]]) -> None:
+        for r in subset:
+            w.writerow(
+                [
+                    section,
+                    r.get("id"),
+                    r.get("title"),
+                    r.get("status"),
+                    r.get("assignee_tg_id"),
+                    r.get("assignee_name") or "",
+                    r.get("due_at") or "",
+                    r.get("created_at") or "",
+                    r.get("completed_at") or "",
+                    r.get("source_group_id") or "",
+                    r.get("batch_id") or "",
+                ]
+            )
+
+    write_block("awaiting_delivery", [r for r in rows if r["status"] == "pending"])
+    write_block("in_progress", [r for r in rows if r["status"] == "sent"])
+    write_block("completed", [r for r in rows if r["status"] == "done"])
+    write_block("cancelled", [r for r in rows if r["status"] == "cancelled"])
+    return buf.getvalue()
+
+
+def build_tasks_summary_md(
+    con: sqlite3.Connection,
+    scope: str,
+    assignee_tg_id: Optional[str],
+    group_id: Optional[str],
+) -> str:
+    rows = tasks_for_summary_scope(con, scope, assignee_tg_id, group_id)
+
+    def lines_for(label: str, subset: list[dict[str, Any]]) -> list[str]:
+        if not subset:
+            return [f"## {label}", "_нет_", ""]
+        out = [f"## {label}", ""]
+        for r in subset:
+            name = r.get("assignee_name") or ""
+            out.append(
+                f"- **{r.get('id')}** — {r.get('title')} — `{r.get('status')}` — "
+                f"{name} (tg {r.get('assignee_tg_id')}) — срок: {r.get('due_at') or '—'}"
+            )
+        out.append("")
+        return out
+
+    parts = ["# Свод по задачам", ""]
+    parts += lines_for("Ожидают доставки (pending)", [r for r in rows if r["status"] == "pending"])
+    parts += lines_for("В работе (sent)", [r for r in rows if r["status"] == "sent"])
+    parts += lines_for("Выполнено (done)", [r for r in rows if r["status"] == "done"])
+    parts += lines_for("Отменено (cancelled)", [r for r in rows if r["status"] == "cancelled"])
+    return "\n".join(parts).rstrip() + "\n"
 
 
 # ── Attachments ──────────────────────────────────────────────────────────

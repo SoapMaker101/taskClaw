@@ -28,3 +28,7 @@
 | `BROKER_API_SECRET` | Bearer для REST |
 | `BROKER_HOST` / `BROKER_PORT` | По умолчанию `127.0.0.1:8089` |
 | `DATABASE_PATH` | Путь к SQLite |
+| `REMINDER_TIMEZONE` | Часовой пояс окна напоминаний (по умолчанию `Europe/Moscow`) |
+| `REMINDER_WINDOW_START_HOUR` / `REMINDER_WINDOW_END_HOUR` | Окно отправки `[start, end)` (например 8–19) |
+| `LONG_TASK_REMINDER_MIN_HOURS` | Порог «длинной» задачи для периодических напоминаний до срока (по умолчанию 72) |
+| `MAX_GROUP_MEMBERS` | Лимит участников группы при fan-out |

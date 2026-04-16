@@ -30,6 +30,22 @@ curl -sS -H "${H}" \
 echo "== list tasks =="
 curl -sS -H "${H}" "${BASE}/tasks" | jq .
 
+echo "== groups: list =="
+curl -sS -H "${H}" "${BASE}/groups" | jq .
+
+echo "== groups: create (set MEMBER_TG_IDS JSON array of registered contacts) =="
+# MEMBERS_JSON='["111","222"]'
+# curl -sS -H "${H}" -H "Content-Type: application/json" \
+#   -d "{\"name\":\"E2E group\",\"member_tg_ids\":${MEMBERS_JSON:-[]}}" \
+#   "${BASE}/groups" | jq .
+
+echo "== reports: tasks summary CSV =="
+curl -sS -H "${H}" -o /tmp/tasks-summary.csv \
+  "${BASE}/reports/tasks-summary?scope=all&format=csv" && head -5 /tmp/tasks-summary.csv
+
+echo "== chairman remind (only works 08:00-19:00 local REMINDER_TIMEZONE) =="
+# curl -sS -X POST -H "${H}" "${BASE}/tasks/${TASK_ID}/chairman-remind" | jq .
+
 echo "== upload extra attachment to a task =="
 echo "(set TASK_ID from the create response above)"
 # curl -sS -H "${H}" -F "file=@/tmp/report.pdf" "${BASE}/tasks/${TASK_ID}/attachments" | jq .
